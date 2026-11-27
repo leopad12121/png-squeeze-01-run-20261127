@@ -14,15 +14,19 @@
 //        - grey (type 0) / grey+alpha (type 4) / RGB (type 2) / RGBA (type 6),
 //          with a tRNS key when the alpha channel only ever carries 0/255
 //          and every transparent pixel shares one colour value.
-//   4. For each form, try filter strategies per row: each fixed filter,
-//      the minimum-signed-sum heuristic, the fewest-distinct-byte-pairs
-//      heuristic, and a brute-force choice that compresses every row's five
-//      filterings with deflate at level 4 against the 32 KiB already written
-//      and keeps the smallest. Screen every (form, strategy) with a full
-//      zlib level 6 deflate, keep the two smallest, and re-deflate those at
-//      level 9 (a few zlib settings tried, smallest kept).
+//   4. For each form, try filter strategies per row: the unfiltered and
+//      Paeth fixed filters, the minimum-signed-sum heuristic and the
+//      fewest-distinct-byte-pairs heuristic. Screen every (form, strategy)
+//      with a full zlib level 6 deflate, keep the two smallest, and
+//      re-deflate those at level 9 (two zlib settings tried, smallest kept).
 //   5. Write the winner as a PNG holding only IHDR / PLTE / tRNS / IDAT /
 //      IEND, bit depth 8, not interlaced, one zlib stream.
+//
+// Deliberately NOT used: per-row brute-force filter search (deflate per row
+// is ~0.7 s per form for under 1% size) and an optimal-parse deflater
+// (measured 5.5-8.4 s per large instance for 0.4-3% size, and its cheaper
+// chain/round variants score worse than zlib level 9). The 60 s wall for
+// all 8 instances is budgeted by fixed work, never by the clock.
 //
 // Node 22 built-ins only. No network, no clock reads, no environment reads
 // as a source of variation (only MAKEFUN_INPUT_DIR / MAKEFUN_OUTPUT_DIR,
@@ -31,7 +35,6 @@
 import { inflateSync, deflateSync, constants } from 'node:zlib';
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { deflateOptimal } from './deflate.ts';
 
 const W = 1280;
 const H = 720;
@@ -269,7 +272,7 @@ interface Form {
   samples: Uint8Array; // height rows of width*bpp samples, unfiltered
   plte: Uint8Array | null;
   trns: Uint8Array | null;
-  strategies: (number | 'minsum' | 'pairs' | 'brute')[];
+  strategies: (number | 'minsum' | 'pairs')[];
 }
 
 const lumOf = (c: Colour): number => 299 * c.r + 587 * c.g + 114 * c.b;
@@ -298,7 +301,7 @@ function paletteForm(rgba: Uint8Array, colours: Colour[], order: 'count' | 'lumi
   const u32 = new Uint32Array(rgba.buffer, rgba.byteOffset, N);
   const indices = new Uint8Array(N);
   for (let i = 0; i < N; i++) indices[i] = index.get(u32[i]) as number;
-  const strategies: Form['strategies'] = order === 'luminance' ? [0, 'minsum', 'brute'] : [0, 'minsum'];
+  const strategies: Form['strategies'] = [0, 'minsum'];
   return { colourType: 3, bpp: 1, samples: indices, plte, trns, strategies };
 }
 
@@ -323,7 +326,7 @@ function channelForm(rgba: Uint8Array, ct: number, trns: Uint8Array | null): For
       }
     }
   }
-  return { colourType: ct, bpp: ch, samples, plte: null, trns, strategies: [0, 1, 2, 3, 4, 'minsum', 'pairs', 'brute'] };
+  return { colourType: ct, bpp: ch, samples, plte: null, trns, strategies: [0, 4, 'minsum', 'pairs'] };
 }
 
 /** Every lossless form that can hold this image, in trial order. */
@@ -401,17 +404,14 @@ function pairsOf(row: Uint8Array): number {
   return n;
 }
 
-const BRUTE_CONTEXT = 32768;
-const BRUTE_LEVEL = 4;
-
 /**
  * The filtered data of one form under one strategy: height rows, each behind
- * its filter byte. 'brute' compresses each row's five filterings with deflate
- * at level 4 against the 32 KiB already written and keeps the smallest.
- * When `out` is given, the data is written into it (so one scratch buffer
- * can serve every strategy of a form) and it is returned.
+ * its filter byte. 'minsum' picks the filter with the smallest signed-byte
+ * sum per row, 'pairs' the one with the fewest distinct neighbouring byte
+ * pairs. When `out` is given, the data is written into it (so one scratch
+ * buffer can serve every strategy of a form) and it is returned.
  */
-export function filtered(samples: Uint8Array, bpp: number, choice: number | 'minsum' | 'pairs' | 'brute', out?: Uint8Array): Uint8Array {
+export function filtered(samples: Uint8Array, bpp: number, choice: number | 'minsum' | 'pairs', out?: Uint8Array): Uint8Array {
   const stride = W * bpp;
   const raw = out ?? new Uint8Array(H * (stride + 1));
   const trial = Array.from({ length: 5 }, () => new Uint8Array(stride + 1));
@@ -425,22 +425,11 @@ export function filtered(samples: Uint8Array, bpp: number, choice: number | 'min
       filterRow(choice, cur, prev, bpp, raw.subarray(at + 1, at + 1 + stride));
       continue;
     }
-    const before = raw.subarray(Math.max(0, at - BRUTE_CONTEXT), at);
     let type = 0;
     let best = Infinity;
     for (let t = 0; t < 5; t++) {
       filterRow(t, cur, prev, bpp, trial[t].subarray(1));
-      let cost: number;
-      if (choice === 'minsum') cost = signedSum(trial[t].subarray(1));
-      else if (choice === 'pairs') cost = pairsOf(trial[t].subarray(1));
-      else {
-        cost = deflateSync(
-          trial[t],
-          before.length === 0
-            ? { level: BRUTE_LEVEL, memLevel: 9 }
-            : { level: BRUTE_LEVEL, memLevel: 9, dictionary: before },
-        ).length;
-      }
+      const cost = choice === 'minsum' ? signedSum(trial[t].subarray(1)) : pairsOf(trial[t].subarray(1));
       if (cost < best) {
         best = cost;
         type = t;
@@ -454,11 +443,11 @@ export function filtered(samples: Uint8Array, bpp: number, choice: number | 'min
 // --------------------------------------------------------------- squeezing --
 
 const SCREEN = { level: 6, memLevel: 8, strategy: constants.Z_DEFAULT_STRATEGY };
+// memLevel 9 never won on the practice set (it was slower and larger), and
+// the filtered strategy only sometimes beats default, so two settings.
 const FINAL_SETTINGS = [
   { level: 9, memLevel: 8, strategy: constants.Z_DEFAULT_STRATEGY },
-  { level: 9, memLevel: 9, strategy: constants.Z_DEFAULT_STRATEGY },
   { level: 9, memLevel: 8, strategy: constants.Z_FILTERED },
-  { level: 9, memLevel: 9, strategy: constants.Z_FILTERED },
 ];
 
 function chunkOverhead(form: Form): number {
@@ -499,8 +488,6 @@ export function squeeze(rgba: Uint8Array): Uint8Array {
   ranked.sort((a, b) => a.bytes - b.bytes);
   let best: Uint8Array | null = null;
   let bestBytes = Infinity;
-  let bestForm: Form | null = null;
-  let bestData: Uint8Array | null = null;
   const finalists = ranked.slice(0, 2);
   for (const cand of finalists) {
     for (const settings of FINAL_SETTINGS) {
@@ -508,26 +495,8 @@ export function squeeze(rgba: Uint8Array): Uint8Array {
       const total = zlib.length + chunkOverhead(cand.form);
       if (total < bestBytes) {
         bestBytes = total;
-        bestForm = cand.form;
-        bestData = cand.data;
         best = pngOf(cand.form.colourType, cand.form.plte, cand.form.trns, new Uint8Array(zlib.buffer, zlib.byteOffset, zlib.length));
       }
-    }
-  }
-  // The optimal-parse deflater earns its keep only on the large RGB/RGBA
-  // streams (about 2.8-3.7 MB of filtered data); on the small palette/grey
-  // streams zlib level 9 already wins, so the work is skipped there. It is
-  // only an improvement attempt: any failure keeps the zlib stream.
-  if (best !== null && bestForm !== null && bestData !== null && bestData.length > 2500000) {
-    try {
-      const opt = deflateOptimal(bestData, W * bestForm.bpp + 1);
-      const total = opt.length + chunkOverhead(bestForm);
-      if (total < bestBytes) {
-        bestBytes = total;
-        best = pngOf(bestForm.colourType, bestForm.plte, bestForm.trns, opt);
-      }
-    } catch {
-      // Keep the zlib stream.
     }
   }
   if (best === null) throw new Error('no candidate');
